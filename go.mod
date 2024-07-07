@@ -1,4 +1,4 @@
-module text-editor
+module onyx
 
 go 1.22.5
 
