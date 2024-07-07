@@ -18,6 +18,12 @@ Onyx is a command-line text editor written in Go, designed for efficient and cus
  `onyx file`.
 2. Start creating or editing text files directly from the command line.
 
+## Keybinds
+Escape - Exit
+Ctrl+C - Copy
+Ctrl+Q - Paste
+Ctrl+S - Save
+
 ## Contributing
 Contributions are welcome! Feel free to submit issues, feature requests, or pull requests to help improve Onyx.
 
