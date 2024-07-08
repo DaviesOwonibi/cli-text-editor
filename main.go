@@ -31,26 +31,39 @@ func readFileIntoBuffer(filename string) error {
 	// Open the file
 	file, err := os.Open(filename)
 	if err != nil {
-		return err
+		// If the file does not exist, create it
+		file, err = os.Create(filename)
+		if err != nil {
+			return err
+		}
 	}
 	defer file.Close()
 
-	// Read lines from the file
-	scanner := bufio.NewScanner(file)
-	textBuffer = nil // Clear existing buffer
-	for scanner.Scan() {
-		textBuffer = append(textBuffer, []rune(scanner.Text()))
-	}
-
-	if err := scanner.Err(); err != nil {
+	// Check if the file is empty
+	stat, err := file.Stat()
+	if err != nil {
 		return err
+	}
+	if stat.Size() == 0 {
+		// If the file is empty, initialize textBuffer as an empty 2D array
+		textBuffer = [][]rune{}
+	} else {
+		// Read lines from the file
+		scanner := bufio.NewScanner(file)
+		textBuffer = nil // Clear existing buffer
+		for scanner.Scan() {
+			textBuffer = append(textBuffer, []rune(scanner.Text()))
+		}
+
+		if err := scanner.Err(); err != nil {
+			return err
+		}
 	}
 
 	// Reset cursor position
 	cursorX, cursorY = 0, 0
 	return nil
 }
-
 func main() {
 	filename = os.Args[1]
 	initializeBuffer()
@@ -283,12 +296,36 @@ func insertNewLine() {
 }
 
 func insertSpace() {
+	if textBuffer == nil || cursorY < 0 || cursorY >= len(textBuffer) {
+		textBuffer = [][]rune{{}}
+		cursorY = 0
+	}
+
+	if cursorX < 0 {
+		cursorX = 0
+	} else if cursorX > len(textBuffer[cursorY]) {
+		cursorX = len(textBuffer[cursorY])
+	}
+
 	line := textBuffer[cursorY]
 	textBuffer[cursorY] = append(line[:cursorX], append([]rune{' '}, line[cursorX:]...)...)
 	cursorX++
 }
 
 func insertCharacter(ch rune) {
+	if textBuffer == nil || cursorY < 0 || cursorY >= len(textBuffer) {
+		// Initialize textBuffer with an empty line if it's nil or cursorY is out of range
+		textBuffer = [][]rune{{}}
+		cursorY = 0
+	}
+
+	// Ensure cursorX is within valid range for the current line
+	if cursorX < 0 {
+		cursorX = 0
+	} else if cursorX > len(textBuffer[cursorY]) {
+		cursorX = len(textBuffer[cursorY])
+	}
+
 	line := textBuffer[cursorY]
 	textBuffer[cursorY] = append(line[:cursorX], append([]rune{ch}, line[cursorX:]...)...)
 	cursorX++
