@@ -2,421 +2,1188 @@ package main
 
 import (
 	"bufio"
-	"log"
+	"fmt"
 	"os"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
 
+	"github.com/atotto/clipboard"
+	"github.com/mattn/go-runewidth"
 	"github.com/nsf/termbox-go"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
-type Selection struct {
-	active         bool
-	startX, startY int
-	endX, endY     int
-}
+var (
+	ROWS, COLS             int
+	offsetRow, offsetCol   int
+	currentCol, currentRow int
+	source_file            string
+	mode                   int
+	text_buffer            = [][]rune{}
+)
 
-type CopiedText struct {
-	active bool
-	text   []rune
+type EditorState struct {
+	buffer    [][]rune
+	cursorRow int
+	cursorCol int
+	offsetRow int
+	offsetCol int
 }
 
 var (
-	textBuffer       [][]rune
-	cursorX, cursorY int
-	selection        Selection
-	copiedText       CopiedText
-	filename         string
+	undoStack []EditorState
+	redoStack []EditorState
 )
 
-func readFileIntoBuffer(filename string) error {
-	// Open the file
+const maxUndoLevels = 100
+
+var (
+	copy_buffer      = []rune{}
+	modified         int
+	searchHighlights []struct {
+		row, startCol, endCol int
+	}
+)
+var searchQuery string
+
+const (
+	lineNumberWidth = 5
+	tabWidth        = 2
+)
+
+var (
+	file_extension string
+	parentDir      string
+	homeDir        string
+)
+
+var keywords = map[string]bool{
+	"func":    true,
+	"var":     true,
+	"const":   true,
+	"if":      true,
+	"else":    true,
+	"for":     true,
+	"return":  true,
+	"import":  true,
+	"package": true,
+	"type":    true,
+	"struct":  true,
+	"switch":  true,
+	"case":    true,
+}
+
+var primitives = map[string]bool{
+	"int":     true,
+	"int8":    true,
+	"int32":   true,
+	"int64":   true,
+	"string":  true,
+	"bool":    true,
+	"boolean": true,
+	"rune":    true,
+	"true":    true,
+	"false":   true,
+}
+
+var operators = map[rune]bool{
+	'+': true,
+	'-': true,
+	'*': true,
+	'/': true,
+	'=': true,
+	'>': true,
+	'<': true,
+	'!': true,
+	';': true,
+	':': true,
+	'.': true,
+}
+
+var ints = map[rune]bool{
+	0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: true, 8: true, 9: true,
+}
+
+func isKeyword(word string) bool {
+	_, found := keywords[word]
+	return found
+}
+
+func isPrimitive(word string) bool {
+	_, found := primitives[word]
+	return found
+}
+
+func isOperator(ch rune) bool {
+	_, found := operators[ch]
+	return found
+}
+
+func isInt(ch rune) bool {
+	_, found := ints[ch]
+	return found
+}
+
+func findText() {
+	searchHighlights = []struct{ row, startCol, endCol int }{}
+	searchQuery = ""
+
+	mode = 2 // Assuming 2 is the mode for searching
+
+	// Initialize index for navigating through search highlights
+	highlightIndex := 0
+
+	for {
+		termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
+		display_text_buffer()
+		print_message(0, ROWS, termbox.ColorBlack, termbox.ColorWhite, " "+string('\ue23e')+" "+string('\uf002')+" SEARCH: "+searchQuery)
+		termbox.SetCursor(len("SEARCH: ")+len(searchQuery)+5, ROWS)
+		termbox.Flush()
+
+		ev := termbox.PollEvent()
+		switch ev.Type {
+		case termbox.EventKey:
+			switch ev.Key {
+			case termbox.KeyEsc:
+				mode = 0
+				searchHighlights = []struct{ row, startCol, endCol int }{}
+				return
+			case termbox.KeyEnter:
+				if len(searchHighlights) > 0 {
+					// Navigate to the current search highlight
+					if highlightIndex >= len(searchHighlights) {
+						highlightIndex = 0 // Loop back to the start if at the end
+					}
+					currentRow = searchHighlights[highlightIndex].row
+					currentCol = searchHighlights[highlightIndex].startCol
+					lineToJump := currentRow + 1
+					jumpToLine(&lineToJump)
+					highlightIndex++
+					searchHighlights = []struct{ row, startCol, endCol int }{}
+					for i, line := range text_buffer {
+						lineStr := string(line)
+						index := 0
+						for {
+							startIndex := strings.Index(lineStr[index:], searchQuery)
+							if startIndex == -1 {
+								break
+							}
+							startIndex += index
+							endIndex := startIndex + len(searchQuery)
+							searchHighlights = append(searchHighlights, struct{ row, startCol, endCol int }{i, startIndex, endIndex})
+							index = endIndex
+						}
+					}
+				}
+				// Do not change mode here; stay in search mode
+			case termbox.KeyBackspace, termbox.KeyBackspace2:
+				if len(searchQuery) > 0 {
+					searchQuery = searchQuery[:len(searchQuery)-1]
+				}
+			default:
+				if ev.Ch != 0 {
+					searchQuery += string(ev.Ch)
+				} else if ev.Key == termbox.KeySpace {
+					searchQuery += " "
+				}
+			}
+		}
+
+		// Perform search only if searchQuery is not empty
+
+		if searchQuery != "" {
+			searchHighlights = []struct{ row, startCol, endCol int }{}
+			// Convert searchQuery to lower case for case-insensitive comparison
+			lowerSearchQuery := strings.ToLower(searchQuery)
+
+			for i, line := range text_buffer {
+				lineStr := string(line)
+				// Convert lineStr to lower case for case-insensitive comparison
+				lowerLineStr := strings.ToLower(lineStr)
+				index := 0
+				for {
+					startIndex := strings.Index(lowerLineStr[index:], lowerSearchQuery)
+					if startIndex == -1 {
+						break
+					}
+					startIndex += index
+					endIndex := startIndex + len(lowerSearchQuery)
+					searchHighlights = append(searchHighlights, struct{ row, startCol, endCol int }{i, startIndex, endIndex})
+					index = endIndex
+				}
+			}
+		} else {
+			searchHighlights = []struct{ row, startCol, endCol int }{} // Clear highlights if search query is empty
+		}
+	}
+}
+
+func read_file(filename string) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Println("Error getting current directory:", err)
+		return
+	}
+
+	fullPath := filepath.Join(cwd, filename)
+	file_extension = strings.Split(filename, ".")[1]
+	parentDir = filepath.Base(filepath.Dir(fullPath))
+	dirname, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Println(err)
+	}
+	homeDir = dirname
+
 	file, err := os.Open(filename)
 	if err != nil {
-		// If the file does not exist, create it
-		file, err = os.Create(filename)
-		if err != nil {
-			return err
-		}
+		fmt.Println("Error opening file:", err)
+		return
 	}
 	defer file.Close()
 
-	// Check if the file is empty
-	stat, err := file.Stat()
+	// Open a file for writing the rune output
+	outputFile := "randomFile.txt" // You can set this to any desired filename
+	outFile, err := os.Create(outputFile)
 	if err != nil {
-		return err
+		fmt.Println("Error creating output file:", err)
+		return
 	}
-	if stat.Size() == 0 {
-		// If the file is empty, initialize textBuffer as an empty 2D array
-		textBuffer = [][]rune{}
-	} else {
-		// Read lines from the file
-		scanner := bufio.NewScanner(file)
-		textBuffer = nil // Clear existing buffer
-		for scanner.Scan() {
-			textBuffer = append(textBuffer, []rune(scanner.Text()))
-		}
+	defer outFile.Close()
 
-		if err := scanner.Err(); err != nil {
-			return err
-		}
-	}
+	scanner := bufio.NewScanner(file)
+	lineNumber := 0
 
-	// Reset cursor position
-	cursorX, cursorY = 0, 0
-	return nil
-}
-func main() {
-	filename = os.Args[1]
-	initializeBuffer()
-	err := readFileIntoBuffer(filename)
-	if err != nil {
-		log.Fatal(err)
-	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		text_buffer = append(text_buffer, []rune{})
 
-	err = termbox.Init()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer termbox.Close()
+		for _, r := range line {
+			unicodeStr := fmt.Sprintf("\\u{%X}", r)
+			hexStr := strings.Trim(unicodeStr, "\\u{}")
 
-	drawUI()
-	eventLoop()
-}
-
-func initializeBuffer() {
-	textBuffer = [][]rune{
-		[]rune("Start typing."),
-	}
-	cursorX, cursorY = 0, 0
-	selection = Selection{}
-	copiedText = CopiedText{}
-}
-
-func isSelected(x, y int) bool {
-	if !selection.active {
-		return false
-	}
-	startX, startY := selection.startX, selection.startY
-	endX, endY := selection.endX, selection.endY
-	if startY > endY || (startY == endY && startX > endX) {
-		startX, startY, endX, endY = endX, endY, startX, startY
-	}
-	if y < startY || y > endY {
-		return false
-	}
-	if y == startY && y == endY {
-		return x >= startX && x <= endX
-	}
-	if y == startY {
-		return x >= startX
-	}
-	if y == endY {
-		return x <= endX
-	}
-	return true
-}
-
-func drawUI() {
-	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
-	for y, line := range textBuffer {
-		for x, ch := range line {
-			bg := termbox.ColorDefault
-			if selection.active && isSelected(x, y) {
-				bg = termbox.ColorBlue
-			}
-			termbox.SetCell(x, y, ch, termbox.ColorDefault, bg)
-		}
-	}
-	termbox.SetCursor(cursorX, cursorY)
-	termbox.Flush()
-}
-
-func eventLoop() {
-	for {
-		switch ev := termbox.PollEvent(); ev.Type {
-		case termbox.EventKey:
-			if ev.Key == termbox.KeyEsc {
+			codePoint, err := strconv.ParseInt(hexStr, 16, 32)
+			if err != nil {
+				fmt.Println("Error parsing Unicode code point:", err)
 				return
 			}
-			handleKeyEvent(ev)
 
-		case termbox.EventError:
-			log.Fatal(ev.Err)
+			r = rune(codePoint)
+			text_buffer[lineNumber] = append(text_buffer[lineNumber], r)
+
+			// Write the rune and its Unicode representation to the output file
+			fmt.Fprintf(outFile, "Rune: %c, Unicode: \\u{%X}\n", r, r)
 		}
+		lineNumber++
+	}
+
+	if lineNumber == 0 {
+		text_buffer = append(text_buffer, []rune{})
 	}
 }
 
-func moveCursor(dy, dx int, selectMode bool) {
-	if selectMode && !selection.active {
-		selection.active = true
-		selection.startX, selection.startY = cursorX, cursorY
-	}
-
-	if cursorY+dy >= 0 && cursorY+dy < len(textBuffer) {
-		cursorY += dy
-		if cursorX+dx >= 0 && cursorX+dx <= len(textBuffer[cursorY]) {
-			cursorX += dx
-		}
-	}
-
-	if selectMode {
-		selection.endX, selection.endY = cursorX, cursorY
+func insert_rune(event termbox.Event) {
+	push_buffer()
+	insert_rune := make([]rune, len(text_buffer[currentRow])+1)
+	copy(insert_rune[:currentCol], text_buffer[currentRow][:currentCol])
+	if event.Key == termbox.KeySpace {
+		insert_rune[currentCol] = rune(' ')
+	} else if event.Key == termbox.KeyTab {
+		insert_rune[currentCol] = rune(' ')
 	} else {
-		selection.active = false
+		insert_rune[currentCol] = rune(event.Ch)
+	}
+	copy(insert_rune[currentCol+1:], text_buffer[currentRow][currentCol:])
+	text_buffer[currentRow] = insert_rune
+	currentCol++
+}
+
+func delete_rune() {
+	push_buffer()
+	if currentCol > 0 {
+		currentCol--
+
+		delete_line := make([]rune, len(text_buffer[currentRow])-1)
+		copy(delete_line[:currentCol], text_buffer[currentRow][:currentCol])
+		copy(delete_line[currentCol:], text_buffer[currentRow][currentCol+1:])
+		text_buffer[currentRow] = delete_line
+	} else if currentRow > 0 {
+		append_line := make([]rune, len(text_buffer[currentRow]))
+		copy(append_line, text_buffer[currentRow][currentCol:])
+		new_text_buffer := make([][]rune, len(text_buffer)-1)
+		copy(new_text_buffer[:currentRow], text_buffer[:currentRow])
+		copy(new_text_buffer[currentRow:], text_buffer[currentRow+1:])
+		text_buffer = new_text_buffer
+		currentRow--
+		currentCol = len(text_buffer[currentRow])
+		insert_line := make([]rune, len(text_buffer[currentRow])+len(append_line))
+		copy(insert_line[:len(text_buffer[currentRow])], text_buffer[currentRow])
+		copy(insert_line[len(text_buffer[currentRow]):], append_line)
+		text_buffer[currentRow] = insert_line
 	}
 }
 
-func handleKeyEvent(ev termbox.Event) {
-	switch ev.Key {
-	case termbox.KeyArrowUp:
-		if selection.active {
-			// Move cursor to the start of the selection or to the previous line if at the start of selection
-			if cursorY > selection.startY ||
-				(cursorY == selection.startY && cursorX > selection.startX) {
-				moveCursor(selection.startY-cursorY, selection.startX-cursorX, false)
-			} else {
-				moveCursor(-1, 0, false)
-			}
+func delete_right_rune() {
+	push_buffer()
+	if currentCol < len(text_buffer[currentRow]) {
+		// Delete the character at the current position
+		delete_line := make([]rune, len(text_buffer[currentRow])-1)
+		copy(delete_line[:currentCol], text_buffer[currentRow][:currentCol])
+		copy(delete_line[currentCol:], text_buffer[currentRow][currentCol+1:])
+		text_buffer[currentRow] = delete_line
+	} else if currentRow < len(text_buffer)-1 {
+		// If at the end of a line, join with the next line
+		append_line := make([]rune, len(text_buffer[currentRow+1]))
+		copy(append_line, text_buffer[currentRow+1])
+
+		// Remove the next line from text_buffer
+		new_text_buffer := make([][]rune, len(text_buffer)-1)
+		copy(new_text_buffer[:currentRow+1], text_buffer[:currentRow+1])
+		copy(new_text_buffer[currentRow+1:], text_buffer[currentRow+2:])
+		text_buffer = new_text_buffer
+
+		// Append the next line to the current line
+		insert_line := make([]rune, len(text_buffer[currentRow])+len(append_line))
+		copy(insert_line[:len(text_buffer[currentRow])], text_buffer[currentRow])
+		copy(insert_line[len(text_buffer[currentRow]):], append_line)
+		text_buffer[currentRow] = insert_line
+	}
+	// Note: The cursor position doesn't change when deleting to the right
+}
+
+func insert_line() {
+	push_buffer()
+	right_line := make([]rune, len(text_buffer[currentRow][currentCol:]))
+	copy(right_line, text_buffer[currentRow][currentCol:])
+	left_line := make([]rune, len(text_buffer[currentRow][:currentCol]))
+	copy(left_line, text_buffer[currentRow][:currentCol])
+	text_buffer[currentRow] = left_line
+	currentRow++
+	currentCol = 0
+	new_text_buffer := make([][]rune, len(text_buffer)+1)
+	copy(new_text_buffer, text_buffer[:currentRow])
+	new_text_buffer[currentRow] = right_line
+	copy(new_text_buffer[currentRow+1:], text_buffer[currentRow:])
+	text_buffer = new_text_buffer
+}
+
+func copy_line() {
+	copy_line := make([]rune, len(text_buffer[currentRow]))
+	copy(copy_line, text_buffer[currentRow])
+	copy_buffer = copy_line
+	write_to_clipboard(copy_line)
+}
+
+func paste_line() {
+	push_buffer()
+	if len(copy_buffer) == 0 {
+		currentRow++
+		currentCol = 0
+	}
+	new_text_buffer := make([][]rune, len(text_buffer)+1)
+	copy(new_text_buffer[:currentRow], text_buffer[:currentRow])
+	new_text_buffer[currentRow] = copy_buffer
+	copy(new_text_buffer[currentRow+1:], text_buffer[currentRow:])
+	text_buffer = new_text_buffer
+}
+
+func paste_line_below() {
+	push_buffer()
+	if len(copy_buffer) != 0 {
+		if currentRow < len(text_buffer) {
+			currentRow++
 		} else {
-			moveCursor(-1, 0, false)
+			currentRow = len(text_buffer)
 		}
-	case termbox.KeyArrowDown:
-		moveCursor(1, 0, false)
-	case termbox.KeyArrowLeft:
-		if selection.active {
-			if cursorX > selection.startX ||
-				(cursorX == selection.startX && cursorY > selection.startY) {
-				moveCursor(selection.startX-cursorX, selection.startY-cursorY, false)
-			} else {
-				moveCursor(0, -1, false)
-			}
-		} else {
-			moveCursor(0, -1, false)
-		}
-	case termbox.KeyArrowRight:
-		moveCursor(0, 1, false)
-	case termbox.KeyBackspace, termbox.KeyBackspace2:
-		if selection.active {
-			deleteSelectedText()
-		} else if cursorX > 0 {
-			deleteCharacterBeforeCursor()
-		} else if cursorY > 0 {
-			mergeLines()
-		}
+		currentCol = 0
 
-	case termbox.KeyDelete:
-		deleteCharacterAfterCursor()
+		new_text_buffer := make([][]rune, len(text_buffer)+1)
+		copy(new_text_buffer[:currentRow], text_buffer[:currentRow])
+		new_text_buffer[currentRow] = make([]rune, len(copy_buffer))
+		copy(new_text_buffer[currentRow], copy_buffer)
+		copy(new_text_buffer[currentRow+1:], text_buffer[currentRow:])
 
-	case termbox.KeyEnter:
-		insertNewLine()
-
-	case termbox.KeySpace:
-		insertSpace()
-
-	case termbox.KeyCtrlA:
-		selectAll()
-	case termbox.KeyCtrlC:
-		copyText()
-	case termbox.KeyCtrlQ:
-		pasteText()
-	case termbox.KeyCtrlS:
-		saveBufferToFile()
-
-	default:
-		if ev.Ch != 0 {
-			insertCharacter(ev.Ch)
-		}
-	}
-	drawUI()
-}
-
-func deleteSelectedText() {
-	startX, startY := selection.startX, selection.startY
-	endX, endY := selection.endX, selection.endY
-
-	// Ensure startY <= endY and startX <= endX
-	if startY > endY || (startY == endY && startX > endX) {
-		startX, startY, endX, endY = endX, endY, startX, startY
-	}
-
-	// Delete selected text line by line
-	for y := startY; y <= endY; y++ {
-		line := textBuffer[y]
-		if y == startY {
-			textBuffer[y] = append(line[:startX], line[endX:]...)
-		} else if y == endY {
-			textBuffer[y-1] = append(textBuffer[y-1], line[endX:]...)
-			textBuffer = append(textBuffer[:y], textBuffer[y+1:]...)
-		} else {
-			textBuffer = append(textBuffer[:y], textBuffer[y+1:]...)
-		}
-	}
-
-	// Update cursor position
-	cursorX, cursorY = startX, startY
-	selection.active = false
-}
-
-func deleteCharacterBeforeCursor() {
-	if cursorY >= 0 && cursorX > 0 {
-		line := textBuffer[cursorY]
-		textBuffer[cursorY] = append(line[:cursorX-1], line[cursorX:]...)
-		cursorX--
+		text_buffer = new_text_buffer
 	}
 }
 
-func mergeLines() {
-	if cursorY > 0 {
-		previousLine := textBuffer[cursorY-1]
-		currentLine := textBuffer[cursorY]
-		cursorX = len(previousLine)
-		textBuffer[cursorY-1] = append(previousLine, currentLine...)
-		textBuffer = append(textBuffer[:cursorY], textBuffer[cursorY+1:]...)
-		cursorY--
-	}
-}
-
-func deleteCharacterAfterCursor() {
-	if cursorY < len(textBuffer) {
-		line := textBuffer[cursorY]
-		if cursorX < len(line) {
-			textBuffer[cursorY] = append(line[:cursorX], line[cursorX+1:]...)
-		}
-	}
-}
-
-func insertNewLine() {
-	line := textBuffer[cursorY]
-	newLine := line[cursorX:]
-	textBuffer[cursorY] = line[:cursorX]
-	textBuffer = append(
-		textBuffer[:cursorY+1],
-		append([][]rune{newLine}, textBuffer[cursorY+1:]...)...)
-	cursorX = 0
-	cursorY++
-}
-
-func insertSpace() {
-	if textBuffer == nil || cursorY < 0 || cursorY >= len(textBuffer) {
-		textBuffer = [][]rune{{}}
-		cursorY = 0
-	}
-
-	if cursorX < 0 {
-		cursorX = 0
-	} else if cursorX > len(textBuffer[cursorY]) {
-		cursorX = len(textBuffer[cursorY])
-	}
-
-	line := textBuffer[cursorY]
-	textBuffer[cursorY] = append(line[:cursorX], append([]rune{' '}, line[cursorX:]...)...)
-	cursorX++
-}
-
-func insertCharacter(ch rune) {
-	if textBuffer == nil || cursorY < 0 || cursorY >= len(textBuffer) {
-		// Initialize textBuffer with an empty line if it's nil or cursorY is out of range
-		textBuffer = [][]rune{{}}
-		cursorY = 0
-	}
-
-	// Ensure cursorX is within valid range for the current line
-	if cursorX < 0 {
-		cursorX = 0
-	} else if cursorX > len(textBuffer[cursorY]) {
-		cursorX = len(textBuffer[cursorY])
-	}
-
-	line := textBuffer[cursorY]
-	textBuffer[cursorY] = append(line[:cursorX], append([]rune{ch}, line[cursorX:]...)...)
-	cursorX++
-}
-
-func selectAll() {
-	selection.active = true
-	selection.startX, selection.startY = 0, 0
-	selection.endY = len(textBuffer) - 1
-	selection.endX = len(textBuffer[selection.endY])
-	cursorX = selection.endX
-	cursorY = selection.endY
-}
-
-func copyText() {
-	if !selection.active {
+func cut_line() {
+	push_buffer()
+	copy_line()
+	if currentRow >= len(text_buffer) || len(text_buffer) < 2 {
 		return
 	}
 
-	startX, startY := selection.startX, selection.startY
-	endX, endY := selection.endX, selection.endY
+	new_text_buffer := make([][]rune, len(text_buffer)-1)
+	copy(new_text_buffer[:currentRow], text_buffer[:currentRow])
+	copy(new_text_buffer[currentRow:], text_buffer[currentRow+1:])
+	text_buffer = new_text_buffer
 
-	// Ensure startY <= endY and startX <= endX
-	if startY > endY || (startY == endY && startX > endX) {
-		startX, startY, endX, endY = endX, endY, startX, startY
+	if currentRow > 0 {
+		currentRow--
+		currentCol = 0
 	}
-
-	// Copy selected text to clipboard or store it somewhere
-	copiedText.text = nil // Clear previous copied text
-	for y := startY; y <= endY; y++ {
-		line := textBuffer[y]
-		if y == startY && y == endY {
-			copiedText.text = append(copiedText.text, line[startX:endX]...)
-		} else if y == startY {
-			copiedText.text = append(copiedText.text, line[startX:]...)
-		} else if y == endY {
-			copiedText.text = append(copiedText.text, line[:endX]...)
-		} else {
-			copiedText.text = append(copiedText.text, line...)
-		}
-	}
-	copiedText.active = true
 }
 
-func pasteText() {
-	if !copiedText.active || len(copiedText.text) == 0 {
+func push_buffer() {
+	state := EditorState{
+		buffer:    make([][]rune, len(text_buffer)),
+		cursorRow: currentRow,
+		cursorCol: currentCol,
+		offsetRow: offsetRow,
+		offsetCol: offsetCol,
+	}
+	for i := range text_buffer {
+		state.buffer[i] = make([]rune, len(text_buffer[i]))
+		copy(state.buffer[i], text_buffer[i])
+	}
+	undoStack = append(undoStack, state)
+
+	// Limit the undo stack size
+	if len(undoStack) > maxUndoLevels {
+		undoStack = undoStack[1:]
+	}
+}
+
+func pull_buffer() {
+	if len(undoStack) == 0 {
+		modified = 1
+		return
+	}
+	redoStack = append(redoStack, EditorState{
+		buffer:    text_buffer,
+		cursorRow: currentRow,
+		cursorCol: currentCol,
+		offsetRow: offsetRow,
+		offsetCol: offsetCol,
+	})
+
+	// Restore the last state from the undo stack
+	lastState := undoStack[len(undoStack)-1]
+	text_buffer = lastState.buffer
+	currentRow = lastState.cursorRow
+	currentCol = lastState.cursorCol
+	offsetRow = lastState.offsetRow
+	offsetCol = lastState.offsetCol
+
+	undoStack = undoStack[:len(undoStack)-1]
+}
+
+func redo_buffer() {
+	if len(redoStack) == 0 {
+		return
+	}
+	// Push current state to undoStack before redoing
+	push_buffer()
+
+	// Restore the last state from the redo stack
+	lastState := redoStack[len(redoStack)-1]
+	text_buffer = lastState.buffer
+	currentRow = lastState.cursorRow
+	currentCol = lastState.cursorCol
+	offsetRow = lastState.offsetRow
+	offsetCol = lastState.offsetCol
+
+	redoStack = redoStack[:len(redoStack)-1]
+}
+
+func jumpToLine(initialLineNumber *int) {
+	mode = 3
+
+	if initialLineNumber != nil {
+		// Jump to the initial line directly
+		lineNumber := *initialLineNumber
+		if lineNumber > 0 && lineNumber <= len(text_buffer) {
+			currentRow = lineNumber - 1
+			currentCol = 0
+
+			// Calculate the maximum offset that would display the last line at the bottom
+			maxOffset := len(text_buffer) - ROWS
+			if maxOffset < 0 {
+				maxOffset = 0
+			}
+
+			// Set the offset to center the cursor, but don't exceed maxOffset
+			offsetRow = currentRow - ROWS/2
+			if offsetRow > maxOffset {
+				offsetRow = maxOffset
+			}
+			if offsetRow < 0 {
+				offsetRow = 0
+			}
+		}
+		mode = 0
 		return
 	}
 
-	// Insert copied text into buffer at cursor position
-	for _, ch := range copiedText.text {
-		// Ensure cursorY is within valid range
-		if cursorY < 0 {
-			cursorY = 0
-		} else if cursorY > len(textBuffer) {
-			cursorY = len(textBuffer)
-		}
+	// Handle interactive input if no initial line number is provided
+	lineNumberStr := ""
+	for {
+		termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
+		display_text_buffer()
+		print_message(0, ROWS, termbox.ColorBlack, termbox.ColorWhite, " "+string('\ue23e')+" Jump to line: "+lineNumberStr)
+		termbox.SetCursor(len("Jump to line: ")+len(lineNumberStr)+3, ROWS)
+		termbox.Flush()
 
-		// Insert the character at cursorX position
-		if cursorY < len(textBuffer) {
-			textBuffer[cursorY] = append(
-				textBuffer[cursorY],
-				' ',
-			) // Ensure enough space at end of line
-			copy(textBuffer[cursorY][cursorX+1:], textBuffer[cursorY][cursorX:])
-			textBuffer[cursorY][cursorX] = ch
-		} else {
-			// Append new line if cursorY is out of range
-			textBuffer = append(textBuffer, []rune{ch})
+		ev := termbox.PollEvent()
+		switch ev.Type {
+		case termbox.EventKey:
+			switch ev.Key {
+			case termbox.KeyEsc:
+				mode = 0
+				return
+			case termbox.KeyEnter:
+				if lineNumber, err := strconv.Atoi(lineNumberStr); err == nil && lineNumber > 0 && lineNumber <= len(text_buffer) {
+					currentRow = lineNumber - 1
+					currentCol = 0
+
+					// Calculate the maximum offset that would display the last line at the bottom
+					maxOffset := len(text_buffer) - ROWS
+					if maxOffset < 0 {
+						maxOffset = 0
+					}
+
+					// Set the offset to center the cursor, but don't exceed maxOffset
+					offsetRow = currentRow - ROWS/2
+					if offsetRow > maxOffset {
+						offsetRow = maxOffset
+					}
+					if offsetRow < 0 {
+						offsetRow = 0
+					}
+				}
+				mode = 0
+				return
+			case termbox.KeyBackspace, termbox.KeyBackspace2:
+				if len(lineNumberStr) > 0 {
+					lineNumberStr = lineNumberStr[:len(lineNumberStr)-1]
+				}
+			default:
+				if ev.Ch >= '0' && ev.Ch <= '9' {
+					lineNumberStr += string(ev.Ch)
+				}
+			}
 		}
-		cursorX++
 	}
-
-	// Move cursor to the end of pasted text
-	cursorY = len(textBuffer) - 1
-	cursorX = len(textBuffer[cursorY])
 }
-func saveBufferToFile() error {
-	// Open the file for writing
+
+func write_file(filename string) {
 	file, err := os.Create(filename)
 	if err != nil {
-		return err
+		fmt.Println("Error creating file:", err)
+		return
 	}
 	defer file.Close()
 
-	// Write each line of textBuffer to the file
-	for _, line := range textBuffer {
-		if _, err := file.WriteString(string(line) + "\n"); err != nil {
-			return err
+	// Create a UTF-8 encoder
+	utf8Encoder := unicode.UTF8.NewEncoder()
+	writer := transform.NewWriter(file, utf8Encoder)
+
+	for _, line := range text_buffer {
+		_, err = writer.Write([]byte(string(line) + "\n"))
+		if err != nil {
+			fmt.Println("Error writing to file:", err)
+			return
 		}
 	}
 
-	return nil
+	err = writer.Close()
+	if err != nil {
+		fmt.Println("Error closing writer:", err)
+		return
+	}
+
+	modified = 2
+}
+
+func scroll_text_buffer() {
+	if currentRow < offsetRow {
+		offsetRow = currentRow
+	}
+
+	if currentCol < offsetCol {
+		offsetCol = currentCol
+	}
+
+	if currentRow >= offsetRow+ROWS {
+		offsetRow = currentRow - ROWS + 1
+	}
+	if currentCol >= offsetCol+COLS-lineNumberWidth {
+		offsetCol = currentCol - COLS + lineNumberWidth + 1
+	}
+}
+
+func display_text_buffer() {
+	var row, col int
+	inString := false          // Track if we're inside a string
+	stringDelimiter := rune(0) // To track the current string delimiter
+	inComment := false         // Track if we're inside a comment
+	bg := termbox.ColorDefault
+
+	for row = 0; row < ROWS; row++ {
+		text_buffer_row := row + offsetRow
+
+		// Display line number
+		lineNumber := fmt.Sprintf("%*d", lineNumberWidth-1, text_buffer_row+1)
+		if currentRow == text_buffer_row {
+			for i, ch := range lineNumber {
+				termbox.SetCell(i, row, ch, termbox.ColorLightGray, termbox.ColorDefault)
+			}
+			termbox.SetCell(lineNumberWidth-1, row, '\u2502', termbox.ColorLightGray, termbox.ColorDefault)
+		} else {
+			for i, ch := range lineNumber {
+				termbox.SetCell(i, row, ch, termbox.ColorBlack, termbox.ColorDefault)
+			}
+			termbox.SetCell(lineNumberWidth-1, row, '\u2502', termbox.ColorBlack, termbox.ColorDefault)
+		}
+
+		if text_buffer_row < len(text_buffer) {
+			line := text_buffer[text_buffer_row]
+			word := ""
+			visibleCol := 0 // Track the visible column on the screen
+
+			// Initialize `inComment` flag
+			inComment = false
+
+			// Determine the initial `inString` state based on the portion of the line before the visible area
+			inString, stringDelimiter = determineInStringState(string(line), offsetCol, inString, stringDelimiter)
+
+			for col = 0; col < COLS-lineNumberWidth; col++ {
+				text_buffer_column := col + offsetCol
+
+				if text_buffer_column < len(line) {
+					ch := line[text_buffer_column]
+					bg = termbox.ColorDefault
+					highlighted := false
+					for _, highlight := range searchHighlights {
+						if highlight.row == text_buffer_row &&
+							text_buffer_column >= highlight.startCol &&
+							text_buffer_column < highlight.endCol {
+							highlighted = true
+							bg = termbox.ColorYellow
+							break
+						}
+					}
+
+					if inComment {
+						termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorBlack, bg)
+						visibleCol++
+						if ch == '\n' {
+							inComment = false // End of line, exit comment mode
+						}
+					} else if inString {
+						// Handle escape characters in string
+						if ch == '\\' && text_buffer_column+1 < len(line) && line[text_buffer_column+1] == stringDelimiter {
+							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorGreen, bg)
+							visibleCol++
+							text_buffer_column++
+							ch = line[text_buffer_column]
+						}
+
+						// Highlight string
+						termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorGreen, bg)
+						visibleCol++
+
+						if ch == stringDelimiter {
+							inString = false
+							stringDelimiter = rune(0)
+						}
+					} else {
+						if ch == '/' && text_buffer_column+1 < len(line) && line[text_buffer_column+1] == '/' {
+							inComment = true
+							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorBlack, bg)
+							visibleCol++
+							text_buffer_column++ // Skip the next character '/'
+						} else if ch == '"' || ch == '\'' || ch == '`' {
+							inString = true
+							stringDelimiter = rune(ch) // Set the current delimiter
+							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorGreen, bg)
+							visibleCol++
+						} else if isOperator(ch) {
+							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorRed, bg)
+							visibleCol++
+						} else if isInt(ch) {
+							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorCyan, bg)
+							visibleCol++
+
+						} else if ch == ' ' || ch == '{' || ch == '(' || ch == '\u0085' || ch == '\u2028' || ch == '\u2029' || ch == '}' || ch == '\u0030' || ch == '\u0033' || ch == ')' {
+							if len(word) > 0 {
+								if isKeyword(word) {
+									for i := 0; i < len(word); i++ {
+										termbox.SetCell(visibleCol+lineNumberWidth-len(word)+i, row, rune(word[i]), termbox.ColorMagenta, bg)
+									}
+								} else if isPrimitive(word) {
+									for i := 0; i < len(word); i++ {
+										termbox.SetCell(visibleCol+lineNumberWidth-len(word)+i, row, rune(word[i]), termbox.ColorYellow, bg)
+									}
+								}
+								word = ""
+							}
+							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorDefault, bg)
+							visibleCol++
+						} else if ch == '\t' {
+							// Expand the tab into spaces
+							spaceCount := tabWidth - (visibleCol % tabWidth)
+							for i := 0; i < spaceCount; i++ {
+								termbox.SetCell(visibleCol+lineNumberWidth, row, ' ', termbox.ColorDefault, bg)
+								visibleCol++
+							}
+						} else {
+							word += string(ch)
+							if highlighted {
+								termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorBlack, termbox.ColorYellow)
+							} else {
+								termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorDefault, bg)
+							}
+							visibleCol++
+						}
+					}
+				} else {
+					break
+				}
+			}
+
+			if inString {
+				inString = false
+				stringDelimiter = rune(0)
+			}
+			if len(word) > 0 {
+				if isKeyword(word) {
+					for i := 0; i < len(word); i++ {
+						termbox.SetCell(visibleCol+lineNumberWidth-len(word)+i, row, rune(word[i]), termbox.ColorMagenta, bg)
+					}
+				} else if isPrimitive(word) {
+					for i := 0; i < len(word); i++ {
+						termbox.SetCell(visibleCol+lineNumberWidth-len(word)+i, row, rune(word[i]), termbox.ColorYellow, bg)
+					}
+				}
+			}
+		}
+	}
+}
+
+func determineInStringState(line string, offsetCol int, previousInString bool, prevDelimiter rune) (bool, rune) {
+	inString := previousInString
+	delimiter := prevDelimiter
+	for i := 0; i < offsetCol && i < len(line); i++ {
+		if line[i] == '"' || line[i] == '\'' || line[i] == '\u0060' {
+			if delimiter == 0 {
+				inString = !inString
+				delimiter = rune(line[i])
+			} else if rune(line[i]) == delimiter {
+				inString = !inString
+				delimiter = 0
+			}
+		} else if line[i] == '\\' && i+1 < len(line) && rune(line[i+1]) == delimiter {
+			i++ // Skip the escaped quote
+		}
+	}
+	return inString, delimiter
+}
+
+func display_status_bar() {
+	var mode_status string
+	var file_status string
+	var copy_status string
+	var undo_status string
+	var logo rune
+
+	if mode == 1 {
+		mode_status = " " + string('\ue23e') + " INSERT: "
+	} else if mode == 2 {
+		mode_status = " " + string('\ue23e') + " " + string('\uf002') + " SEARCH: "
+	} else if mode == 3 {
+		mode_status = " " + string('\ue23e') + " JUMP TO: "
+	} else {
+		mode_status = " " + string('\ue23e') + " NORMAL: "
+	}
+
+	filename_length := len(source_file)
+	switch file_extension {
+	case "astro":
+		logo = '\ue6b3'
+	case "asm":
+		logo = '\ueae8'
+	case "bat":
+		logo = ''
+	case "bash":
+		logo = ''
+	case "c":
+		logo = '\ue61e'
+	case "cs":
+		logo = '\ue648'
+	case "cpp":
+		logo = ''
+	case "css":
+		logo = ''
+	case "csv":
+		logo = ''
+	case "cmake":
+		logo = ''
+	case "dart":
+		logo = ''
+	case "html":
+		logo = ''
+	case "hpp":
+		logo = ''
+	case "go":
+		logo = ''
+	case "jsx":
+		logo = ''
+	case "tsx":
+		logo = ''
+	case "java":
+		logo = ''
+	case "lua":
+		logo = ''
+	case "md":
+		logo = ''
+	case "php":
+		logo = '\ue73d'
+	case "ps1":
+		logo = '󰨊'
+	case "py":
+		logo = ''
+	case "vimrc":
+		logo = ''
+	case "vim":
+		logo = ''
+	case "js":
+		logo = ''
+	case "json":
+		logo = ''
+	case "rs":
+		logo = ''
+	case "rb":
+		logo = '\ue739'
+	case "sh":
+		logo = ''
+	case "gitignore":
+		logo = '\ue702'
+	case "sql":
+		logo = ''
+	case "sqlite":
+		logo = '\ue7c4'
+	case "db":
+		logo = '\ue64d'
+	case "swift":
+		logo = '\ue755'
+	case "toml":
+		logo = ''
+	case "txt":
+		logo = '\uf15b'
+	case "scss":
+		logo = ''
+	case "sass":
+		logo = ''
+	case "ts":
+		logo = ''
+	case "exe":
+		logo = '\ueae8'
+	case "prisma":
+		logo = ''
+	case "tmux":
+		logo = ''
+	case "vue":
+		logo = ''
+	case "wasm":
+		logo = ''
+	case "yaml":
+		logo = ''
+	case "yml":
+		logo = ''
+	case "zsh":
+		logo = ''
+	default:
+		logo = '\uf15b'
+	}
+
+	if filename_length > 13 {
+		filename_length = 13
+	}
+
+	if len(text_buffer) > 1 {
+		file_status = source_file[:filename_length] + " " + string(logo) + " . " + strconv.Itoa(len(text_buffer)) + " lines"
+	} else {
+		file_status = source_file[:filename_length] + " " + string(logo) + " . " + strconv.Itoa(len(text_buffer)) + " line"
+	}
+	if modified == 0 {
+		file_status += " modified"
+	} else if modified == 1 {
+		file_status += " oldest change"
+	} else if modified == 2 {
+		file_status += " saved"
+	}
+	var parent_status string
+	homeDir = path.Base(filepath.Dir(homeDir))
+
+	if parentDir == homeDir {
+		parent_status = string('\uf015') + " " + parentDir + " "
+	} else {
+		parent_status = string('\uf07b') + " " + parentDir + " "
+	}
+
+	file_percent := string('\ue64e') + " " + strconv.Itoa((currentRow+1)*100/len(text_buffer)) + "%"
+	if len(copy_buffer) > 0 {
+		copy_status = " [Copy]"
+	}
+	if len(undoStack) > 0 {
+		undo_status = " [Undo]"
+	}
+	used_space := len(mode_status) + len(file_status) + len(copy_status) + len(undo_status) + len(file_percent) + len(parent_status)
+	spaces := strings.Repeat(" ", COLS-used_space)
+	message := mode_status + file_status + copy_status + undo_status + spaces + parent_status + file_percent
+	print_message(0, ROWS, termbox.ColorBlack, termbox.ColorWhite, message)
+}
+
+func print_message(column int, row int, fg termbox.Attribute, bg termbox.Attribute, message string) {
+	for _, ch := range message {
+		termbox.SetCell(column, row, ch, fg, bg)
+		column += runewidth.RuneWidth(ch)
+	}
+}
+
+func get_key() termbox.Event {
+	var key_event termbox.Event
+	switch event := termbox.PollEvent(); event.Type {
+	case termbox.EventKey:
+		key_event = event
+	case termbox.EventError:
+		panic(event.Err)
+	}
+	return key_event
+}
+
+func write_to_clipboard(runes []rune) {
+	string_to_write := string(runes)
+	err := clipboard.WriteAll(string_to_write)
+	if err != nil {
+		return
+	}
+}
+
+func handle_close() {
+	if modified != 0 {
+		termbox.Close()
+		os.Exit(0)
+	} else {
+		var answer string
+		for {
+			termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
+			display_text_buffer()
+			print_message(0, ROWS, termbox.ColorBlack, termbox.ColorWhite, " Would you like to save before leaving(y/n): "+answer)
+			termbox.SetCursor(len("Would you like to save before leaving (y/n): ")+len(answer), ROWS)
+			termbox.Flush()
+
+			ev := termbox.PollEvent()
+			if ev.Type == termbox.EventKey {
+				switch ev.Key {
+				case termbox.KeyEnter:
+					if answer == "y" {
+						write_file(source_file)
+						termbox.Close()
+						os.Exit(0)
+					} else if answer == "n" {
+						termbox.Close()
+						os.Exit(0)
+					}
+				case termbox.KeyBackspace, termbox.KeyBackspace2:
+					if len(answer) > 0 {
+						answer = answer[:len(answer)-1]
+					}
+				default:
+					if ev.Ch == 'y' || ev.Ch == 'n' {
+						answer = string(ev.Ch)
+					}
+				}
+			}
+		}
+	}
+}
+
+func process_key_press() {
+	key_event := get_key()
+	if key_event.Key == termbox.KeyEsc {
+		mode = 0
+	} else if key_event.Ch != 0 {
+		if mode == 1 {
+			insert_rune(key_event)
+			modified = 0
+		} else {
+			switch key_event.Ch {
+			case 'q':
+				handle_close()
+			case 'i':
+				mode = 1
+			case 'v':
+				mode = 4
+			case 'w':
+				write_file(source_file)
+			case 'y':
+				copy_line()
+				modified = 0
+			case 'P':
+				paste_line()
+				modified = 0
+			case 'd':
+				cut_line()
+				modified = 0
+			case 'u':
+				pull_buffer()
+			case 'p':
+				paste_line_below()
+				modified = 0
+			case '/':
+				findText()
+			case 'g':
+				jumpToLine(nil)
+			case 'k':
+				if currentRow != 0 {
+					currentRow--
+				}
+			case 'j':
+				if currentRow < len(text_buffer)-1 {
+					currentRow++
+				}
+			case 'h':
+				if currentCol != 0 {
+					currentCol--
+				} else if currentRow > 0 {
+					currentRow--
+					currentCol = len(text_buffer[currentRow])
+				}
+			case 'l':
+				if currentCol != len(text_buffer[currentRow]) {
+					currentCol++
+				} else if currentRow < len(text_buffer)-1 {
+					currentRow++
+					currentCol = 0
+				}
+			case 't':
+				lineNumber := 1
+				jumpToLine(&lineNumber)
+			case 'b':
+				lineNumber := len(text_buffer)
+				jumpToLine(&lineNumber)
+			}
+
+			if currentCol > len(text_buffer[currentRow]) {
+				currentCol = len(text_buffer[currentRow])
+			}
+			if currentCol < 0 {
+				currentCol = 0
+			}
+		}
+	} else {
+		switch key_event.Key {
+		case termbox.KeyEnter:
+			if mode == 1 {
+				insert_line()
+				modified = 0
+			} else {
+				if currentRow < len(text_buffer)-1 {
+					currentRow++
+				}
+			}
+		case termbox.KeyBackspace:
+			delete_rune()
+			modified = 0
+		case termbox.KeyBackspace2:
+			delete_rune()
+			modified = 0
+		case termbox.KeyDelete:
+			delete_right_rune()
+			modified = 0
+		case termbox.KeyTab:
+			if mode == 1 {
+				for i := 0; i < tabWidth; i++ {
+					insert_rune(key_event)
+				}
+				modified = 0
+			}
+		case termbox.KeySpace:
+			if mode == 1 {
+				insert_rune(key_event)
+				modified = 0
+			}
+		case termbox.KeyHome:
+			currentCol = 0
+		case termbox.KeyEnd:
+			currentCol = len(text_buffer[currentRow])
+		case termbox.KeyPgup:
+			if currentRow-int(ROWS/4) > 0 {
+				currentRow -= int(ROWS / 4)
+			}
+		case termbox.KeyPgdn:
+			if currentRow+int(ROWS/4) < len(text_buffer)-1 {
+				currentRow += int(ROWS / 4)
+			}
+		case termbox.KeyArrowUp:
+			if currentRow != 0 {
+				currentRow--
+			}
+		case termbox.KeyArrowDown:
+			if currentRow < len(text_buffer)-1 {
+				currentRow++
+			}
+		case termbox.KeyArrowLeft:
+			if currentCol != 0 {
+				currentCol--
+			} else if currentRow > 0 {
+				currentRow--
+				currentCol = len(text_buffer[currentRow])
+			}
+		case termbox.KeyArrowRight:
+			if currentCol != len(text_buffer[currentRow]) {
+				currentCol++
+			} else if currentRow < len(text_buffer)-1 {
+				currentRow++
+				currentCol = 0
+			}
+		}
+		if currentCol > len(text_buffer[currentRow]) {
+			currentCol = len(text_buffer[currentRow])
+		}
+		if currentCol < 0 {
+			currentCol = 0
+		}
+	}
+}
+
+func run_editor() {
+	err := termbox.Init()
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	if len(os.Args) > 1 {
+		source_file = os.Args[1]
+		read_file(source_file)
+	} else {
+		source_file = "out.txt"
+		text_buffer = append(text_buffer, []rune{})
+	}
+
+	modified = 1
+	for {
+		COLS, ROWS = termbox.Size()
+		ROWS--
+		if COLS < 78 {
+			COLS = 78
+		}
+		termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
+		scroll_text_buffer()
+		display_text_buffer()
+		display_status_bar()
+		termbox.SetCursor(currentCol-offsetCol+lineNumberWidth, currentRow-offsetRow)
+		termbox.Flush()
+		process_key_press()
+	}
+}
+
+func main() {
+	run_editor()
 }
