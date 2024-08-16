@@ -4,16 +4,15 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"path"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/atotto/clipboard"
 	"github.com/mattn/go-runewidth"
 	"github.com/nsf/termbox-go"
-	"golang.org/x/text/encoding/unicode"
-	"golang.org/x/text/transform"
 )
 
 var (
@@ -21,8 +20,21 @@ var (
 	offsetRow, offsetCol   int
 	currentCol, currentRow int
 	source_file            string
+	source_file2           string
 	mode                   int
 	text_buffer            = [][]rune{}
+	undoStack              []EditorState
+	redoStack              []EditorState
+	copy_buffer            = []rune{}
+	modified               int
+	searchHighlights       []struct{ row, startCol, endCol int }
+	searchQuery            string
+	file_extension         string
+	parentDir              string
+	homeDir                string
+	bytesWritten           int = 0
+	selectionStart         struct{ row, col int }
+	selectionEnd           struct{ row, col int }
 )
 
 type EditorState struct {
@@ -33,114 +45,23 @@ type EditorState struct {
 	offsetCol int
 }
 
-var (
-	undoStack []EditorState
-	redoStack []EditorState
-)
-
-const maxUndoLevels = 100
-
-var (
-	copy_buffer      = []rune{}
-	modified         int
-	searchHighlights []struct {
-		row, startCol, endCol int
-	}
-)
-var searchQuery string
-
 const (
+	maxUndoLevels   = 500
 	lineNumberWidth = 5
-	tabWidth        = 2
+	tabWidth        = 1
 )
-
-var (
-	file_extension string
-	parentDir      string
-	homeDir        string
-)
-
-var keywords = map[string]bool{
-	"func":    true,
-	"var":     true,
-	"const":   true,
-	"if":      true,
-	"else":    true,
-	"for":     true,
-	"return":  true,
-	"import":  true,
-	"package": true,
-	"type":    true,
-	"struct":  true,
-	"switch":  true,
-	"case":    true,
-}
-
-var primitives = map[string]bool{
-	"int":     true,
-	"int8":    true,
-	"int32":   true,
-	"int64":   true,
-	"string":  true,
-	"bool":    true,
-	"boolean": true,
-	"rune":    true,
-	"true":    true,
-	"false":   true,
-}
-
-var operators = map[rune]bool{
-	'+': true,
-	'-': true,
-	'*': true,
-	'/': true,
-	'=': true,
-	'>': true,
-	'<': true,
-	'!': true,
-	';': true,
-	':': true,
-	'.': true,
-}
-
-var ints = map[rune]bool{
-	0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: true, 8: true, 9: true,
-}
-
-func isKeyword(word string) bool {
-	_, found := keywords[word]
-	return found
-}
-
-func isPrimitive(word string) bool {
-	_, found := primitives[word]
-	return found
-}
-
-func isOperator(ch rune) bool {
-	_, found := operators[ch]
-	return found
-}
-
-func isInt(ch rune) bool {
-	_, found := ints[ch]
-	return found
-}
 
 func findText() {
 	searchHighlights = []struct{ row, startCol, endCol int }{}
 	searchQuery = ""
-
-	mode = 2 // Assuming 2 is the mode for searching
-
-	// Initialize index for navigating through search highlights
+	mode = 2
 	highlightIndex := 0
 
 	for {
 		termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 		display_text_buffer()
-		print_message(0, ROWS, termbox.ColorBlack, termbox.ColorWhite, " "+string('\ue23e')+" "+string('\uf002')+" SEARCH: "+searchQuery)
-		termbox.SetCursor(len("SEARCH: ")+len(searchQuery)+5, ROWS)
+		print_message(0, ROWS, termbox.ColorWhite, termbox.ColorDefault, " "+string('\ue23e')+"  "+string('\uf002')+" SEARCH: "+searchQuery+" ")
+		termbox.SetCursor(len("  SEARCH: ")+len(searchQuery)+4, ROWS)
 		termbox.Flush()
 
 		ev := termbox.PollEvent()
@@ -149,11 +70,13 @@ func findText() {
 			switch ev.Key {
 			case termbox.KeyEsc:
 				mode = 0
+				if len(searchHighlights) > 0 && searchQuery != "" {
+					currentCol = searchHighlights[highlightIndex].startCol
+				}
 				searchHighlights = []struct{ row, startCol, endCol int }{}
 				return
 			case termbox.KeyEnter:
-				if len(searchHighlights) > 0 {
-					// Navigate to the current search highlight
+				if len(searchHighlights) > 0 && searchQuery != "" {
 					if highlightIndex >= len(searchHighlights) {
 						highlightIndex = 0 // Loop back to the start if at the end
 					}
@@ -162,23 +85,7 @@ func findText() {
 					lineToJump := currentRow + 1
 					jumpToLine(&lineToJump)
 					highlightIndex++
-					searchHighlights = []struct{ row, startCol, endCol int }{}
-					for i, line := range text_buffer {
-						lineStr := string(line)
-						index := 0
-						for {
-							startIndex := strings.Index(lineStr[index:], searchQuery)
-							if startIndex == -1 {
-								break
-							}
-							startIndex += index
-							endIndex := startIndex + len(searchQuery)
-							searchHighlights = append(searchHighlights, struct{ row, startCol, endCol int }{i, startIndex, endIndex})
-							index = endIndex
-						}
-					}
 				}
-				// Do not change mode here; stay in search mode
 			case termbox.KeyBackspace, termbox.KeyBackspace2:
 				if len(searchQuery) > 0 {
 					searchQuery = searchQuery[:len(searchQuery)-1]
@@ -192,16 +99,12 @@ func findText() {
 			}
 		}
 
-		// Perform search only if searchQuery is not empty
-
 		if searchQuery != "" {
 			searchHighlights = []struct{ row, startCol, endCol int }{}
-			// Convert searchQuery to lower case for case-insensitive comparison
 			lowerSearchQuery := strings.ToLower(searchQuery)
 
 			for i, line := range text_buffer {
 				lineStr := string(line)
-				// Convert lineStr to lower case for case-insensitive comparison
 				lowerLineStr := strings.ToLower(lineStr)
 				index := 0
 				for {
@@ -215,9 +118,39 @@ func findText() {
 					index = endIndex
 				}
 			}
+
+			// Check if any of the highlights are within the current view
+			inView := false
+			for _, highlight := range searchHighlights {
+				if highlight.row >= currentRow && highlight.row < currentRow+ROWS {
+					inView = true
+					break
+				}
+			}
+
+			// If no highlights are in view, jump to the first result
+			if !inView && len(searchHighlights) > 0 {
+				highlightIndex = 0
+				currentRow = searchHighlights[highlightIndex].row
+				currentCol = searchHighlights[highlightIndex].startCol
+				lineToJump := currentRow + 1
+				jumpToLine(&lineToJump)
+			}
 		} else {
 			searchHighlights = []struct{ row, startCol, endCol int }{} // Clear highlights if search query is empty
 		}
+	}
+}
+
+func ClearScreen() {
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("cmd", "/c", "cls")
+		cmd.Stdout = os.Stdout
+		cmd.Run()
+	} else {
+		cmd := exec.Command("clear")
+		cmd.Stdout = os.Stdout
+		cmd.Run()
 	}
 }
 
@@ -225,33 +158,36 @@ func read_file(filename string) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Println("Error getting current directory:", err)
-		return
+		os.Exit(1)
 	}
 
 	fullPath := filepath.Join(cwd, filename)
-	file_extension = strings.Split(filename, ".")[1]
+	ext := filepath.Ext(filename)
+	file_extension = strings.TrimPrefix(ext, ".")
 	parentDir = filepath.Base(filepath.Dir(fullPath))
 	dirname, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Println(err)
 	}
-	homeDir = dirname
+	homeDir = strings.Trim(dirname, ".")
 
 	file, err := os.Open(filename)
 	if err != nil {
-		fmt.Println("Error opening file:", err)
-		return
+		if os.IsNotExist(err) {
+			file, err = os.Create(filename)
+			if err != nil {
+				ClearScreen()
+				fmt.Println("Error creating file:", err)
+				os.Exit(1)
+			}
+		} else {
+			ClearScreen()
+			fmt.Println("Error:", err)
+			os.Exit(1)
+		}
+	} else {
+		defer file.Close()
 	}
-	defer file.Close()
-
-	// Open a file for writing the rune output
-	outputFile := "randomFile.txt" // You can set this to any desired filename
-	outFile, err := os.Create(outputFile)
-	if err != nil {
-		fmt.Println("Error creating output file:", err)
-		return
-	}
-	defer outFile.Close()
 
 	scanner := bufio.NewScanner(file)
 	lineNumber := 0
@@ -272,9 +208,6 @@ func read_file(filename string) {
 
 			r = rune(codePoint)
 			text_buffer[lineNumber] = append(text_buffer[lineNumber], r)
-
-			// Write the rune and its Unicode representation to the output file
-			fmt.Fprintf(outFile, "Rune: %c, Unicode: \\u{%X}\n", r, r)
 		}
 		lineNumber++
 	}
@@ -291,7 +224,9 @@ func insert_rune(event termbox.Event) {
 	if event.Key == termbox.KeySpace {
 		insert_rune[currentCol] = rune(' ')
 	} else if event.Key == termbox.KeyTab {
-		insert_rune[currentCol] = rune(' ')
+		for i := 0; i < tabWidth; i++ {
+			insert_rune[currentCol] = rune(' ')
+		}
 	} else {
 		insert_rune[currentCol] = rune(event.Ch)
 	}
@@ -304,7 +239,6 @@ func delete_rune() {
 	push_buffer()
 	if currentCol > 0 {
 		currentCol--
-
 		delete_line := make([]rune, len(text_buffer[currentRow])-1)
 		copy(delete_line[:currentCol], text_buffer[currentRow][:currentCol])
 		copy(delete_line[currentCol:], text_buffer[currentRow][currentCol+1:])
@@ -376,35 +310,98 @@ func copy_line() {
 	write_to_clipboard(copy_line)
 }
 
+func copy_selection() {
+	if mode != 4 {
+		return
+	}
+
+	// Clear the existing copy buffer
+	copy_buffer = []rune{}
+
+	// Determine the start and end points of the selection
+	startRow, startCol := selectionStart.row, selectionStart.col
+	endRow, endCol := selectionEnd.row, selectionEnd.col
+
+	// Ensure start is before end
+	if startRow > endRow || (startRow == endRow && startCol > endCol) {
+		startRow, startCol, endRow, endCol = endRow, endCol, startRow, startCol
+	}
+
+	// Copy the selected text
+	for row := startRow; row <= endRow; row++ {
+		lineStart, lineEnd := 0, len(text_buffer[row])
+
+		if row == startRow {
+			lineStart = startCol
+		}
+		if row == endRow {
+			lineEnd = endCol
+		}
+
+		copy_buffer = append(copy_buffer, text_buffer[row][lineStart:lineEnd]...)
+
+		// Add a newline character if it's not the last line
+		if row < endRow {
+			copy_buffer = append(copy_buffer, '\n')
+		}
+	}
+
+	// Write to clipboard
+	write_to_clipboard(copy_buffer)
+}
+
 func paste_line() {
 	push_buffer()
-	if len(copy_buffer) == 0 {
-		currentRow++
-		currentCol = 0
+	content, err := clipboard.ReadAll()
+	if err != nil {
+		return
 	}
-	new_text_buffer := make([][]rune, len(text_buffer)+1)
-	copy(new_text_buffer[:currentRow], text_buffer[:currentRow])
-	new_text_buffer[currentRow] = copy_buffer
-	copy(new_text_buffer[currentRow+1:], text_buffer[currentRow:])
-	text_buffer = new_text_buffer
+
+	var pasteContent []rune
+	if len(content) != 0 {
+		pasteContent = []rune(content)
+	} else if len(copy_buffer) != 0 {
+		pasteContent = copy_buffer
+	}
+
+	if len(pasteContent) != 0 {
+		new_text_buffer := make([][]rune, len(text_buffer)+1)
+		copy(new_text_buffer[:currentRow], text_buffer[:currentRow])
+		new_text_buffer[currentRow] = make([]rune, len(pasteContent))
+		copy(new_text_buffer[currentRow], pasteContent)
+		copy(new_text_buffer[currentRow+1:], text_buffer[currentRow:])
+		text_buffer = new_text_buffer
+		currentCol = 0
+		currentRow++
+	}
 }
 
 func paste_line_below() {
 	push_buffer()
-	if len(copy_buffer) != 0 {
+	content, err := clipboard.ReadAll()
+	if err != nil {
+		return
+	}
+
+	var pasteContent []rune
+	if len(content) != 0 {
+		pasteContent = []rune(content)
+	} else if len(copy_buffer) != 0 {
+		pasteContent = copy_buffer
+	}
+
+	if len(pasteContent) != 0 {
 		if currentRow < len(text_buffer) {
 			currentRow++
 		} else {
 			currentRow = len(text_buffer)
 		}
 		currentCol = 0
-
 		new_text_buffer := make([][]rune, len(text_buffer)+1)
 		copy(new_text_buffer[:currentRow], text_buffer[:currentRow])
-		new_text_buffer[currentRow] = make([]rune, len(copy_buffer))
-		copy(new_text_buffer[currentRow], copy_buffer)
+		new_text_buffer[currentRow] = make([]rune, len(pasteContent))
+		copy(new_text_buffer[currentRow], pasteContent)
 		copy(new_text_buffer[currentRow+1:], text_buffer[currentRow:])
-
 		text_buffer = new_text_buffer
 	}
 }
@@ -412,19 +409,21 @@ func paste_line_below() {
 func cut_line() {
 	push_buffer()
 	copy_line()
-	if currentRow >= len(text_buffer) || len(text_buffer) < 2 {
+	if currentRow >= len(text_buffer) || len(text_buffer) < 1 {
 		return
 	}
-
-	new_text_buffer := make([][]rune, len(text_buffer)-1)
-	copy(new_text_buffer[:currentRow], text_buffer[:currentRow])
-	copy(new_text_buffer[currentRow:], text_buffer[currentRow+1:])
-	text_buffer = new_text_buffer
-
-	if currentRow > 0 {
-		currentRow--
-		currentCol = 0
+	if len(text_buffer) == 1 {
+		text_buffer = [][]rune{}
+	} else {
+		new_text_buffer := make([][]rune, len(text_buffer)-1)
+		copy(new_text_buffer[:currentRow], text_buffer[:currentRow])
+		copy(new_text_buffer[currentRow:], text_buffer[currentRow+1:])
+		text_buffer = new_text_buffer
 	}
+	if currentRow >= len(text_buffer) {
+		currentRow = len(text_buffer) - 1
+	}
+	currentCol = min(currentCol, len(text_buffer[currentRow]))
 }
 
 func push_buffer() {
@@ -471,24 +470,6 @@ func pull_buffer() {
 	undoStack = undoStack[:len(undoStack)-1]
 }
 
-func redo_buffer() {
-	if len(redoStack) == 0 {
-		return
-	}
-	// Push current state to undoStack before redoing
-	push_buffer()
-
-	// Restore the last state from the redo stack
-	lastState := redoStack[len(redoStack)-1]
-	text_buffer = lastState.buffer
-	currentRow = lastState.cursorRow
-	currentCol = lastState.cursorCol
-	offsetRow = lastState.offsetRow
-	offsetCol = lastState.offsetCol
-
-	redoStack = redoStack[:len(redoStack)-1]
-}
-
 func jumpToLine(initialLineNumber *int) {
 	mode = 3
 
@@ -523,7 +504,7 @@ func jumpToLine(initialLineNumber *int) {
 	for {
 		termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 		display_text_buffer()
-		print_message(0, ROWS, termbox.ColorBlack, termbox.ColorWhite, " "+string('\ue23e')+" Jump to line: "+lineNumberStr)
+		print_message(0, ROWS, termbox.ColorWhite, termbox.ColorDefault, " "+string('\ue23e')+" Jump to line: "+lineNumberStr)
 		termbox.SetCursor(len("Jump to line: ")+len(lineNumberStr)+3, ROWS)
 		termbox.Flush()
 
@@ -578,18 +559,18 @@ func write_file(filename string) {
 	defer file.Close()
 
 	// Create a UTF-8 encoder
-	utf8Encoder := unicode.UTF8.NewEncoder()
-	writer := transform.NewWriter(file, utf8Encoder)
+	writer := bufio.NewWriter(file)
 
 	for _, line := range text_buffer {
-		_, err = writer.Write([]byte(string(line) + "\n"))
+		bytesWrited, err := writer.Write([]byte(string(line) + "\n"))
 		if err != nil {
 			fmt.Println("Error writing to file:", err)
 			return
 		}
+		bytesWritten += bytesWrited
 	}
 
-	err = writer.Close()
+	err = writer.Flush()
 	if err != nil {
 		fmt.Println("Error closing writer:", err)
 		return
@@ -617,170 +598,105 @@ func scroll_text_buffer() {
 
 func display_text_buffer() {
 	var row, col int
-	inString := false          // Track if we're inside a string
-	stringDelimiter := rune(0) // To track the current string delimiter
-	inComment := false         // Track if we're inside a comment
-	bg := termbox.ColorDefault
 
 	for row = 0; row < ROWS; row++ {
 		text_buffer_row := row + offsetRow
 
 		// Display line number
 		lineNumber := fmt.Sprintf("%*d", lineNumberWidth-1, text_buffer_row+1)
+		lineColor := termbox.ColorBlack
 		if currentRow == text_buffer_row {
-			for i, ch := range lineNumber {
-				termbox.SetCell(i, row, ch, termbox.ColorLightGray, termbox.ColorDefault)
-			}
-			termbox.SetCell(lineNumberWidth-1, row, '\u2502', termbox.ColorLightGray, termbox.ColorDefault)
-		} else {
-			for i, ch := range lineNumber {
-				termbox.SetCell(i, row, ch, termbox.ColorBlack, termbox.ColorDefault)
-			}
-			termbox.SetCell(lineNumberWidth-1, row, '\u2502', termbox.ColorBlack, termbox.ColorDefault)
+			lineColor = termbox.ColorLightGray
 		}
+		for i, ch := range lineNumber {
+			termbox.SetCell(i, row, ch, lineColor, termbox.ColorDefault)
+		}
+		termbox.SetCell(lineNumberWidth-1, row, '│', lineColor, termbox.ColorDefault)
 
 		if text_buffer_row < len(text_buffer) {
 			line := text_buffer[text_buffer_row]
-			word := ""
-			visibleCol := 0 // Track the visible column on the screen
+			visibleCol := 0   // Track the visible column on the screen
+			columnInLine := 0 // Track the current column in the line
 
-			// Initialize `inComment` flag
-			inComment = false
-
-			// Determine the initial `inString` state based on the portion of the line before the visible area
-			inString, stringDelimiter = determineInStringState(string(line), offsetCol, inString, stringDelimiter)
-
-			for col = 0; col < COLS-lineNumberWidth; col++ {
+			for col = 0; col < COLS-lineNumberWidth && visibleCol < COLS-lineNumberWidth; col++ {
 				text_buffer_column := col + offsetCol
 
 				if text_buffer_column < len(line) {
 					ch := line[text_buffer_column]
-					bg = termbox.ColorDefault
+
+					// Check if this character is part of a search highlight
 					highlighted := false
 					for _, highlight := range searchHighlights {
 						if highlight.row == text_buffer_row &&
 							text_buffer_column >= highlight.startCol &&
 							text_buffer_column < highlight.endCol {
 							highlighted = true
-							bg = termbox.ColorYellow
 							break
 						}
 					}
+					isSelected := mode == 4 && isWithinSelection(text_buffer_row, text_buffer_column)
 
-					if inComment {
-						termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorBlack, bg)
-						visibleCol++
-						if ch == '\n' {
-							inComment = false // End of line, exit comment mode
+					if ch == '\t' {
+						// Calculate the number of spaces needed for the tab
+						spacesToAdd := tabWidth - (columnInLine % tabWidth)
+						bgColor := termbox.ColorDefault
+						if highlighted {
+							bgColor = termbox.ColorYellow
 						}
-					} else if inString {
-						// Handle escape characters in string
-						if ch == '\\' && text_buffer_column+1 < len(line) && line[text_buffer_column+1] == stringDelimiter {
-							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorGreen, bg)
+						if isSelected {
+							bgColor = termbox.ColorDarkGray
+						}
+						for i := 0; i < spacesToAdd && visibleCol < COLS-lineNumberWidth; i++ {
+							termbox.SetCell(visibleCol+lineNumberWidth, row, ' ', termbox.ColorDefault, bgColor)
 							visibleCol++
-							text_buffer_column++
-							ch = line[text_buffer_column]
 						}
-
-						// Highlight string
-						termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorGreen, bg)
-						visibleCol++
-
-						if ch == stringDelimiter {
-							inString = false
-							stringDelimiter = rune(0)
-						}
+						columnInLine += spacesToAdd
 					} else {
-						if ch == '/' && text_buffer_column+1 < len(line) && line[text_buffer_column+1] == '/' {
-							inComment = true
-							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorBlack, bg)
-							visibleCol++
-							text_buffer_column++ // Skip the next character '/'
-						} else if ch == '"' || ch == '\'' || ch == '`' {
-							inString = true
-							stringDelimiter = rune(ch) // Set the current delimiter
-							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorGreen, bg)
-							visibleCol++
-						} else if isOperator(ch) {
-							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorRed, bg)
-							visibleCol++
-						} else if isInt(ch) {
-							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorCyan, bg)
-							visibleCol++
-
-						} else if ch == ' ' || ch == '{' || ch == '(' || ch == '\u0085' || ch == '\u2028' || ch == '\u2029' || ch == '}' || ch == '\u0030' || ch == '\u0033' || ch == ')' {
-							if len(word) > 0 {
-								if isKeyword(word) {
-									for i := 0; i < len(word); i++ {
-										termbox.SetCell(visibleCol+lineNumberWidth-len(word)+i, row, rune(word[i]), termbox.ColorMagenta, bg)
-									}
-								} else if isPrimitive(word) {
-									for i := 0; i < len(word); i++ {
-										termbox.SetCell(visibleCol+lineNumberWidth-len(word)+i, row, rune(word[i]), termbox.ColorYellow, bg)
-									}
-								}
-								word = ""
-							}
-							termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorDefault, bg)
-							visibleCol++
-						} else if ch == '\t' {
-							// Expand the tab into spaces
-							spaceCount := tabWidth - (visibleCol % tabWidth)
-							for i := 0; i < spaceCount; i++ {
-								termbox.SetCell(visibleCol+lineNumberWidth, row, ' ', termbox.ColorDefault, bg)
-								visibleCol++
-							}
-						} else {
-							word += string(ch)
-							if highlighted {
-								termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorBlack, termbox.ColorYellow)
-							} else {
-								termbox.SetCell(visibleCol+lineNumberWidth, row, ch, termbox.ColorDefault, bg)
-							}
-							visibleCol++
+						fgColor := termbox.ColorDefault
+						bgColor := termbox.ColorDefault
+						if highlighted {
+							fgColor = termbox.ColorBlack
+							bgColor = termbox.ColorWhite
 						}
-					}
-				} else {
-					break
-				}
-			}
-
-			if inString {
-				inString = false
-				stringDelimiter = rune(0)
-			}
-			if len(word) > 0 {
-				if isKeyword(word) {
-					for i := 0; i < len(word); i++ {
-						termbox.SetCell(visibleCol+lineNumberWidth-len(word)+i, row, rune(word[i]), termbox.ColorMagenta, bg)
-					}
-				} else if isPrimitive(word) {
-					for i := 0; i < len(word); i++ {
-						termbox.SetCell(visibleCol+lineNumberWidth-len(word)+i, row, rune(word[i]), termbox.ColorYellow, bg)
+						if isSelected {
+							fgColor = termbox.ColorBlack
+							bgColor = termbox.ColorDarkGray
+						}
+						termbox.SetCell(visibleCol+lineNumberWidth, row, ch, fgColor, bgColor)
+						visibleCol++
+						columnInLine++
 					}
 				}
 			}
+		} else if row+offsetRow > len(text_buffer)-1 {
+			termbox.SetCell(lineNumberWidth, row, '~', termbox.ColorBlue, termbox.ColorDefault)
 		}
 	}
 }
 
-func determineInStringState(line string, offsetCol int, previousInString bool, prevDelimiter rune) (bool, rune) {
-	inString := previousInString
-	delimiter := prevDelimiter
-	for i := 0; i < offsetCol && i < len(line); i++ {
-		if line[i] == '"' || line[i] == '\'' || line[i] == '\u0060' {
-			if delimiter == 0 {
-				inString = !inString
-				delimiter = rune(line[i])
-			} else if rune(line[i]) == delimiter {
-				inString = !inString
-				delimiter = 0
-			}
-		} else if line[i] == '\\' && i+1 < len(line) && rune(line[i+1]) == delimiter {
-			i++ // Skip the escaped quote
+func isWithinSelection(row, col int) bool {
+	if selectionStart.row <= selectionEnd.row {
+		if row < selectionStart.row || row > selectionEnd.row {
+			return false
+		}
+		if row == selectionStart.row && col < selectionStart.col {
+			return false
+		}
+		if row == selectionEnd.row && col > selectionEnd.col {
+			return false
+		}
+	} else {
+		if row > selectionStart.row || row < selectionEnd.row {
+			return false
+		}
+		if row == selectionEnd.row && col < selectionEnd.col {
+			return false
+		}
+		if row == selectionStart.row && col > selectionStart.col {
+			return false
 		}
 	}
-	return inString, delimiter
+	return true
 }
 
 func display_status_bar() {
@@ -791,13 +707,15 @@ func display_status_bar() {
 	var logo rune
 
 	if mode == 1 {
-		mode_status = " " + string('\ue23e') + " INSERT: "
+		mode_status = " " + string('\ue23e') + "  INSERT "
 	} else if mode == 2 {
-		mode_status = " " + string('\ue23e') + " " + string('\uf002') + " SEARCH: "
+		mode_status = " " + string('\ue23e') + " " + string('\uf002') + "  SEARCH: "
 	} else if mode == 3 {
-		mode_status = " " + string('\ue23e') + " JUMP TO: "
+		mode_status = " " + string('\ue23e') + "  JUMP TO: "
+	} else if mode == 4 {
+		mode_status = " " + string('\ue23e') + "  VISUAL "
 	} else {
-		mode_status = " " + string('\ue23e') + " NORMAL: "
+		mode_status = " " + string('\ue23e') + "  NORMAL "
 	}
 
 	filename_length := len(source_file)
@@ -805,33 +723,51 @@ func display_status_bar() {
 	case "astro":
 		logo = '\ue6b3'
 	case "asm":
-		logo = '\ueae8'
+		logo = ''
 	case "bat":
 		logo = ''
 	case "bash":
 		logo = ''
 	case "c":
-		logo = '\ue61e'
+		logo = ''
 	case "cs":
-		logo = '\ue648'
+		logo = ''
 	case "cpp":
 		logo = ''
 	case "css":
 		logo = ''
 	case "csv":
 		logo = ''
+	case "cr":
+		logo = ''
 	case "cmake":
 		logo = ''
 	case "dart":
 		logo = ''
+	case "docker":
+		logo = ''
+	case "ex":
+		logo = ''
+	case "exs":
+		logo = ''
 	case "html":
 		logo = ''
 	case "hpp":
 		logo = ''
+	case "hs":
+		logo = ''
+	case "lhs":
+		logo = ''
 	case "go":
+		logo = ''
+	case "sum":
+		logo = ''
+	case "mod":
 		logo = ''
 	case "jsx":
 		logo = ''
+	case "kotlin":
+		logo = ''
 	case "tsx":
 		logo = ''
 	case "java":
@@ -841,7 +777,7 @@ func display_status_bar() {
 	case "md":
 		logo = ''
 	case "php":
-		logo = '\ue73d'
+		logo = '󰌟'
 	case "ps1":
 		logo = '󰨊'
 	case "py":
@@ -857,23 +793,23 @@ func display_status_bar() {
 	case "rs":
 		logo = ''
 	case "rb":
-		logo = '\ue739'
+		logo = ''
 	case "sh":
 		logo = ''
 	case "gitignore":
-		logo = '\ue702'
+		logo = ''
 	case "sql":
 		logo = ''
 	case "sqlite":
-		logo = '\ue7c4'
+		logo = ''
 	case "db":
-		logo = '\ue64d'
+		logo = ''
 	case "swift":
-		logo = '\ue755'
+		logo = ''
 	case "toml":
 		logo = ''
 	case "txt":
-		logo = '\uf15b'
+		logo = ''
 	case "scss":
 		logo = ''
 	case "sass":
@@ -881,7 +817,7 @@ func display_status_bar() {
 	case "ts":
 		logo = ''
 	case "exe":
-		logo = '\ueae8'
+		logo = ''
 	case "prisma":
 		logo = ''
 	case "tmux":
@@ -897,27 +833,34 @@ func display_status_bar() {
 	case "zsh":
 		logo = ''
 	default:
-		logo = '\uf15b'
+		logo = ''
 	}
 
-	if filename_length > 13 {
-		filename_length = 13
+	if filename_length > 25 {
+		filename_length = 25
 	}
+
+	filename_length = min(filename_length, len(source_file))
 
 	if len(text_buffer) > 1 {
-		file_status = source_file[:filename_length] + " " + string(logo) + " . " + strconv.Itoa(len(text_buffer)) + " lines"
+		file_status = string(logo) + " " + source_file2[:filename_length] + " " + strconv.Itoa(len(text_buffer)) + " lines"
 	} else {
-		file_status = source_file[:filename_length] + " " + string(logo) + " . " + strconv.Itoa(len(text_buffer)) + " line"
+		file_status = string(logo) + " " + source_file2[:filename_length] + " " + strconv.Itoa(len(text_buffer)) + " line"
 	}
 	if modified == 0 {
 		file_status += " modified"
 	} else if modified == 1 {
 		file_status += " oldest change"
 	} else if modified == 2 {
-		file_status += " saved"
+		if bytesWritten == 0 {
+			file_status += " saved 0 bytes"
+		} else {
+			file_status += " saved " + strconv.Itoa(bytesWritten) + " bytes"
+			bytesWritten = 0
+		}
 	}
 	var parent_status string
-	homeDir = path.Base(filepath.Dir(homeDir))
+	homeDir = filepath.Base(homeDir)
 
 	if parentDir == homeDir {
 		parent_status = string('\uf015') + " " + parentDir + " "
@@ -932,10 +875,10 @@ func display_status_bar() {
 	if len(undoStack) > 0 {
 		undo_status = " [Undo]"
 	}
-	used_space := len(mode_status) + len(file_status) + len(copy_status) + len(undo_status) + len(file_percent) + len(parent_status)
+	used_space := len(mode_status) + len(file_status) + len(copy_status) + len(undo_status) + len(file_percent) + len(parent_status) + len("ROWS: "+strconv.Itoa(currentRow+1)+" COLS: "+strconv.Itoa(currentCol+1)) - 20
 	spaces := strings.Repeat(" ", COLS-used_space)
 	message := mode_status + file_status + copy_status + undo_status + spaces + parent_status + file_percent
-	print_message(0, ROWS, termbox.ColorBlack, termbox.ColorWhite, message)
+	print_message(0, ROWS, termbox.ColorWhite, termbox.ColorDefault, message)
 }
 
 func print_message(column int, row int, fg termbox.Attribute, bg termbox.Attribute, message string) {
@@ -973,7 +916,7 @@ func handle_close() {
 		for {
 			termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
 			display_text_buffer()
-			print_message(0, ROWS, termbox.ColorBlack, termbox.ColorWhite, " Would you like to save before leaving(y/n): "+answer)
+			print_message(0, ROWS, termbox.ColorWhite, termbox.ColorDefault, " Would you like to save before leaving(y/n): "+answer)
 			termbox.SetCursor(len("Would you like to save before leaving (y/n): ")+len(answer), ROWS)
 			termbox.Flush()
 
@@ -1019,17 +962,28 @@ func process_key_press() {
 				mode = 1
 			case 'v':
 				mode = 4
+				selectionStart.row = currentRow
+				selectionStart.col = currentCol
+				selectionEnd.row = currentRow
+				selectionEnd.col = currentCol
 			case 'w':
 				write_file(source_file)
 			case 'y':
-				copy_line()
-				modified = 0
+				if mode != 4 {
+					copy_line()
+				} else {
+					copy_selection()
+					mode = 0
+				}
 			case 'P':
 				paste_line()
 				modified = 0
 			case 'd':
-				cut_line()
-				modified = 0
+				if currentRow != 0 {
+					cut_line()
+					modified = 0
+				} else {
+				}
 			case 'u':
 				pull_buffer()
 			case 'p':
@@ -1040,33 +994,79 @@ func process_key_press() {
 			case 'g':
 				jumpToLine(nil)
 			case 'k':
-				if currentRow != 0 {
-					currentRow--
+				if mode != 4 {
+					if currentRow != 0 {
+						currentRow--
+					}
+				} else {
+					if currentRow != 0 {
+						currentRow--
+					}
+					selectionEnd.row = currentRow
+					selectionEnd.col = currentCol
 				}
+
 			case 'j':
-				if currentRow < len(text_buffer)-1 {
-					currentRow++
+				if mode != 4 {
+					if currentRow < len(text_buffer)-1 {
+						currentRow++
+					}
+				} else {
+					if currentRow < len(text_buffer)-1 {
+						currentRow++
+					}
+					selectionEnd.row = currentRow
+					selectionEnd.col = currentCol
 				}
 			case 'h':
-				if currentCol != 0 {
-					currentCol--
-				} else if currentRow > 0 {
-					currentRow--
-					currentCol = len(text_buffer[currentRow])
+				if mode != 4 {
+					if currentCol != 0 {
+						currentCol--
+					} else if currentRow > 0 {
+						currentRow--
+						currentCol = len(text_buffer[currentRow])
+					}
+				} else {
+					if currentCol != 0 {
+						currentCol--
+					} else if currentRow > 0 {
+						currentRow--
+						currentCol = len(text_buffer[currentRow])
+					}
+					selectionEnd.row = currentRow
+					selectionEnd.col = currentCol
 				}
+
 			case 'l':
-				if currentCol != len(text_buffer[currentRow]) {
-					currentCol++
-				} else if currentRow < len(text_buffer)-1 {
-					currentRow++
-					currentCol = 0
+				if mode != 4 {
+					if currentCol != len(text_buffer[currentRow]) {
+						currentCol++
+					} else if currentRow < len(text_buffer)-1 {
+						currentRow++
+						currentCol = 0
+					}
+				} else {
+					if currentCol != len(text_buffer[currentRow]) {
+						currentCol++
+					} else if currentRow < len(text_buffer)-1 {
+						currentRow++
+						currentCol = 0
+					}
+					selectionEnd.row = currentRow
+					selectionEnd.col = currentCol
 				}
+
 			case 't':
 				lineNumber := 1
 				jumpToLine(&lineNumber)
 			case 'b':
 				lineNumber := len(text_buffer)
 				jumpToLine(&lineNumber)
+			case 'o':
+				currentCol = len(text_buffer[currentRow])
+				insert_line()
+				modified = 0
+				mode = 1
 			}
 
 			if currentCol > len(text_buffer[currentRow]) {
@@ -1078,6 +1078,8 @@ func process_key_press() {
 		}
 	} else {
 		switch key_event.Key {
+		case termbox.KeyCtrlS:
+			write_file(source_file)
 		case termbox.KeyEnter:
 			if mode == 1 {
 				insert_line()
@@ -1088,14 +1090,41 @@ func process_key_press() {
 				}
 			}
 		case termbox.KeyBackspace:
-			delete_rune()
-			modified = 0
+			if mode == 1 {
+				delete_rune()
+				modified = 0
+			} else {
+				if currentCol != 0 {
+					currentCol--
+				} else if currentRow > 0 {
+					currentRow--
+					currentCol = len(text_buffer[currentRow])
+				}
+			}
 		case termbox.KeyBackspace2:
-			delete_rune()
-			modified = 0
+			if mode == 1 {
+				delete_rune()
+				modified = 0
+			} else {
+				if currentCol != 0 {
+					currentCol--
+				} else if currentRow > 0 {
+					currentRow--
+					currentCol = len(text_buffer[currentRow])
+				}
+			}
 		case termbox.KeyDelete:
-			delete_right_rune()
-			modified = 0
+			if mode == 1 {
+				delete_right_rune()
+				modified = 0
+			} else {
+				if currentCol != len(text_buffer[currentRow]) {
+					currentCol++
+				} else if currentRow < len(text_buffer)-1 {
+					currentRow++
+					currentCol = 0
+				}
+			}
 		case termbox.KeyTab:
 			if mode == 1 {
 				for i := 0; i < tabWidth; i++ {
@@ -1121,26 +1150,64 @@ func process_key_press() {
 				currentRow += int(ROWS / 4)
 			}
 		case termbox.KeyArrowUp:
-			if currentRow != 0 {
-				currentRow--
+			if mode != 4 {
+				if currentRow != 0 {
+					currentRow--
+				}
+			} else {
+				if currentRow != 0 {
+					currentRow--
+				}
+				selectionEnd.row = currentRow
+				selectionEnd.col = currentCol
 			}
 		case termbox.KeyArrowDown:
-			if currentRow < len(text_buffer)-1 {
-				currentRow++
+			if mode != 4 {
+				if currentRow < len(text_buffer)-1 {
+					currentRow++
+				}
+			} else {
+				if currentRow < len(text_buffer)-1 {
+					currentRow++
+				}
+				selectionEnd.row = currentRow
+				selectionEnd.col = currentCol
 			}
 		case termbox.KeyArrowLeft:
-			if currentCol != 0 {
-				currentCol--
-			} else if currentRow > 0 {
-				currentRow--
-				currentCol = len(text_buffer[currentRow])
+			if mode != 4 {
+				if currentCol != 0 {
+					currentCol--
+				} else if currentRow > 0 {
+					currentRow--
+					currentCol = len(text_buffer[currentRow])
+				}
+			} else {
+				if currentCol != 0 {
+					currentCol--
+				} else if currentRow > 0 {
+					currentRow--
+					currentCol = len(text_buffer[currentRow])
+				}
+				selectionEnd.row = currentRow
+				selectionEnd.col = currentCol
 			}
 		case termbox.KeyArrowRight:
-			if currentCol != len(text_buffer[currentRow]) {
-				currentCol++
-			} else if currentRow < len(text_buffer)-1 {
-				currentRow++
-				currentCol = 0
+			if mode != 4 {
+				if currentCol != len(text_buffer[currentRow]) {
+					currentCol++
+				} else if currentRow < len(text_buffer)-1 {
+					currentRow++
+					currentCol = 0
+				}
+			} else {
+				if currentCol != len(text_buffer[currentRow]) {
+					currentCol++
+				} else if currentRow < len(text_buffer)-1 {
+					currentRow++
+					currentCol = 0
+				}
+				selectionEnd.row = currentRow
+				selectionEnd.col = currentCol
 			}
 		}
 		if currentCol > len(text_buffer[currentRow]) {
@@ -1168,6 +1235,9 @@ func run_editor() {
 	}
 
 	modified = 1
+	source_file2 = source_file
+	source_file2 = strings.Replace(source_file, ".", "", 1)
+	source_file2 = strings.ReplaceAll(source_file, "/", "")
 	for {
 		COLS, ROWS = termbox.Size()
 		ROWS--
