@@ -22,10 +22,10 @@ var (
 	source_file            string
 	source_file2           string
 	mode                   int
-	text_buffer            = [][]rune{}
+	text_buffer            [][]rune = [][]rune{}
 	undoStack              []EditorState
 	redoStack              []EditorState
-	copy_buffer            = []rune{}
+	copy_buffer            []rune = []rune{}
 	modified               int
 	searchHighlights       []struct{ row, startCol, endCol int }
 	searchQuery            string
@@ -35,6 +35,7 @@ var (
 	bytesWritten           int = 0
 	selectionStart         struct{ row, col int }
 	selectionEnd           struct{ row, col int }
+	lineNumberWidth        int = 5
 )
 
 type EditorState struct {
@@ -46,9 +47,8 @@ type EditorState struct {
 }
 
 const (
-	maxUndoLevels   = 500
-	lineNumberWidth = 5
-	tabWidth        = 1
+	maxUndoLevels int = 500
+	tabWidth      int = 1
 )
 
 func findText() {
