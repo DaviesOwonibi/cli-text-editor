@@ -635,7 +635,16 @@ func display_text_buffer() {
 						}
 					}
 					isSelected := mode == 4 && isWithinSelection(text_buffer_row, text_buffer_column)
-
+					if ch == ' ' {
+						bgColor := termbox.ColorDefault
+						if highlighted {
+							bgColor = termbox.ColorYellow
+						}
+						if isSelected {
+							bgColor = termbox.ColorDarkGray
+						}
+						termbox.SetCell(visibleCol+lineNumberWidth, row, ' ', termbox.ColorDefault, bgColor)
+					}
 					if ch == '\t' {
 						// Calculate the number of spaces needed for the tab
 						spacesToAdd := tabWidth - (columnInLine % tabWidth)
